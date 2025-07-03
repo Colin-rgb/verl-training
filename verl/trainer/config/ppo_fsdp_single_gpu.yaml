@@ -1,0 +1,125 @@
+# =================================================================================
+# === 最终版：ppo_fsdp_single_gpu.yaml (路径已适配) ===
+# =================================================================================
+
+# --- 1. 数据配置 ---
+data:
+  tokenizer: null
+  # ‼️ 关键修改：使用相对于 training/ 目录的路径
+  train_files: verl_math_dataset/train.parquet
+  val_files: verl_math_dataset/validation.parquet
+  prompt_key: prompt
+  max_prompt_length: 1024
+  max_response_length: 1024
+  # 单卡训练，需要显著减小 batch size 以防止显存不足
+  train_batch_size: 8
+  val_batch_size: 8
+  return_raw_input_ids: False
+  return_raw_chat: True # 为 verifier 提供原始对话
+  # --- 应用论文中的数据/采样设置 ---
+  n_samples: 4 # 对应论文中的 N = 4
+  filter_accuracy: True
+  filter_truncated: True
+  accuracy_lower_bound: 0.2
+  accuracy_upper_bound: 0.8
+  oversample_factor: 1.0
+  system_prompt: null
+
+# --- 2. 核心模型配置 ---
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    # ‼️ 重要：请将路径修改为您的 Qwen 模型实际存放位置
+    #    例如：'./models/qwen2.5-Math-7B'
+    path: path/to/your/qwen2.5-Math-7B
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: True # 开启梯度检查点以节省显存
+  
+  actor:
+    strategy: fsdp # 关键：指定后端为 fsdp
+    ppo_mini_batch_size: 4 
+    ppo_micro_batch_size: 1 # 单卡显存有限，这是单次计算的实际大小
+    clip_ratio: 0.2
+    entropy_coeff: 0.0 # EM-RL 通常不与熵正则化同时使用
+    ppo_epochs: 1
+    shuffle: True
+    optim:
+      lr: 1e-6 # 对应论文中的 learning rate
+      clip_grad: 1.0
+      lr_warmup_steps_ratio: 0.
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      param_offload: True
+      grad_offload: True
+      optimizer_offload: True
+      wrap_policy:
+        min_num_params: 0
+
+  ref:
+    fsdp_config:
+      param_offload: True
+    log_prob_micro_batch_size: 4
+
+  rollout:
+    name: vllm
+    temperature: 1.0
+    top_k: -1
+    top_p: 1.0
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.7 
+    ignore_eos: False
+    enforce_eager: True
+    free_cache_engine: True
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 1 # 单卡必须为 1
+    max_num_batched_tokens: 8192
+    max_num_seqs: 1024
+    log_prob_micro_batch_size: 4
+    do_sample: True
+
+# --- 3. Critic 配置 (不被使用) ---
+critic:
+  strategy: fsdp
+  model:
+    path: ${actor_rollout_ref.model.path}
+
+# --- 4. 奖励模型配置 ---
+reward_model:
+  enable: True
+  rm_type: em_rl_sequence
+  strategy: fsdp
+  rm_coef: 1.0
+  model:
+    path: null
+  load_weight: False
+
+# --- 5. 算法配置 ---
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: rloo
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+# --- 6. 训练器配置 ---
+trainer:
+  total_epochs: 1 
+  project_name: verl_qwen2.5_em_rl
+  experiment_name: em_rl_sequence_single_gpu
+  logger: ['console', 'wandb']
+  wandb_mode: online
+  nnodes: 1
+  n_gpus_per_node: 1 # 关键：指定使用1个GPU
+  save_freq: 100
+  test_freq: 100
+  critic_warmup: 0
+  default_hdfs_dir: null
+  default_local_dir: ./checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  runtime_env: null
+  val_before_train: False

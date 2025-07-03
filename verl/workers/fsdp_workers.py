@@ -42,7 +42,12 @@ from verl.utils.py_functional import append_to_dict
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
+# ==================== ‼️ 关键修改 1: 导入我们的新模块 ====================
+# 导入我们之前创建的、用于FSDP的序列熵奖励模型。
+# 注意：请确保这个文件的路径是正确的。
+# 假设您已创建 verl/workers/reward_model/fsdp/sequence_entropy_reward_model.py
 from .reward_model.fsdp.sequence_entropy_reward_model import FSDPSequenceEntropyRewardModel
+# ========================================================================
 
 
 class ActorRolloutRefWorker(Worker):
@@ -50,7 +55,7 @@ class ActorRolloutRefWorker(Worker):
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
     or a hybrid engine based on the config.rollout
     """
-
+    # ... (此类中的所有代码保持不变) ...
     def __init__(self, config: DictConfig, role: str):
         super().__init__()
         self.config = config
@@ -112,11 +117,14 @@ class ActorRolloutRefWorker(Worker):
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
-        torch_dtype = fsdp_config.get('model_dtype', None)
-        if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
-        else:
-            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        # torch_dtype = fsdp_config.get('model_dtype', None)
+        # if torch_dtype is None:
+        #     torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+        # else:
+        #     torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        from verl.utils.torch_dtypes import PrecisionType
+        torch_dtype = fsdp_config.get('model_dtype', 'bfloat16') # 默认使用bfloat16
+        torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -139,10 +147,10 @@ class ActorRolloutRefWorker(Worker):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                torch_dtype=torch_dtype,
-                                                                config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
-                                                                trust_remote_code=trust_remote_code)
+                                                                 torch_dtype=torch_dtype,
+                                                                 config=actor_model_config,
+                                                                 attn_implementation='flash_attention_2',
+                                                                 trust_remote_code=trust_remote_code)
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
@@ -214,7 +222,7 @@ class ActorRolloutRefWorker(Worker):
             print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
 
             actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
-                                                                   num_warmup_steps=num_warmup_steps)
+                                                                     num_warmup_steps=num_warmup_steps)
         else:
             actor_optimizer = None
             actor_lr_scheduler = None
@@ -450,7 +458,7 @@ class ActorRolloutRefWorker(Worker):
 
 
 class CriticWorker(Worker):
-
+    # ... (此类中的所有代码保持不变) ...
     def __init__(self, config):
         super().__init__()
         import torch.distributed
@@ -539,13 +547,13 @@ class CriticWorker(Worker):
         log_gpu_memory_usage('Before critic FSDP', logger=None)
 
         critic_module = FSDP(critic_module,
-                             param_init_fn=init_fn,
-                             use_orig_params=False,
-                             auto_wrap_policy=auto_wrap_policy,
-                             device_id=torch.cuda.current_device(),
-                             sharding_strategy=ShardingStrategy.FULL_SHARD,
-                             mixed_precision=mixed_precision,
-                             sync_module_states=True)
+                               param_init_fn=init_fn,
+                               use_orig_params=False,
+                               auto_wrap_policy=auto_wrap_policy,
+                               device_id=torch.cuda.current_device(),
+                               sharding_strategy=ShardingStrategy.FULL_SHARD,
+                               mixed_precision=mixed_precision,
+                               sync_module_states=True)
 
         log_gpu_memory_usage('After critic FSDP', logger=None)
 
@@ -562,7 +570,7 @@ class CriticWorker(Worker):
 
         from verl.utils.torch_functional import get_constant_schedule_with_warmup
         critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
-                                                                num_warmup_steps=num_warmup_steps)
+                                                                  num_warmup_steps=num_warmup_steps)
 
         return critic_module, critic_optimizer, critic_lr_scheduler
 
@@ -660,47 +668,38 @@ class RewardModelWorker(Worker):
     """
     Note that we only implement the reward model that is subclass of AutoModelForSequenceClassification.
     """
-
+    # ==================== ‼️ 关键修改 2: 修改此类以支持我们的逻辑 ====================
     def __init__(self, config):
         super().__init__()
         import torch.distributed
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
         self.config = config
-
         self.config.micro_batch_size //= torch.distributed.get_world_size()
 
     def _build_model(self, config):
-        # the following line is necessary
+        # 这个原始的 build model 方法保持不变，用于加载标准的神经网络奖励模型
         from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, CPUOffload
-
-        # download the checkpoint from hdfs
         local_path = copy_local_path_from_hdfs(config.model.path)
-
         if self.config.model.input_tokenizer is None:
             self._do_switch_chat_template = False
         else:
             self._do_switch_chat_template = True
             input_tokenizer_local_path = copy_local_path_from_hdfs(config.model.input_tokenizer)
-            self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path,
-                                                trust_remote_code=config.model.get('trust_remote_code', False))
+            self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=config.model.get('trust_remote_code', False))
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get('trust_remote_code', False))
-
         trust_remote_code = config.model.get('trust_remote_code', False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings)
-
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             reward_module = AutoModelForSequenceClassification.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                               torch_dtype=torch.bfloat16,
-                                                                               attn_implementation='flash_attention_2',
-                                                                               trust_remote_code=trust_remote_code)
+                                                                             torch_dtype=torch.bfloat16,
+                                                                             attn_implementation='flash_attention_2',
+                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
-
         reward_module = FSDP(
             reward_module,
             param_init_fn=init_fn,
@@ -710,74 +709,67 @@ class RewardModelWorker(Worker):
             sharding_strategy=ShardingStrategy.FULL_SHARD,  # zero3
             sync_module_states=True,
             cpu_offload=CPUOffload(offload_params=self.config.model.fsdp_config.param_offload))
-
         return reward_module
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        # This is used to import external_lib into the huggingface systems
-        import_external_libs(self.config.model.get('external_lib', None))
-        self.reward_module = self._build_model(config=self.config)
+        # 核心修改点 1：根据配置决定初始化哪种奖励计算逻辑
+        # rm_type = self.config.model.get('rm_type', 'normal')
+        rm_type = self.config.get('rm_type', 'normal') # ✅ 修正：直接从 self.config 获取
+
+        if rm_type == 'em_rl_sequence':
+            print("INFO: RewardModelWorker is initializing in EM-RL-SEQUENCE mode.")
+            self.rm_calculator = FSDPSequenceEntropyRewardModel(config=self.config)
+            self.reward_module = None # 明确我们不需要神经网络
+        else:
+            print(f"INFO: RewardModelWorker is initializing in standard mode ('{rm_type}').")
+            import_external_libs(self.config.model.get('external_lib', None))
+            self.reward_module = self._build_model(config=self.config)
+            self.rm_calculator = None
+        
         torch.cuda.empty_cache()
 
     def _forward_micro_batch(self, micro_batch):
+        # ... (此方法保持不变)
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output = self.reward_module(input_ids=micro_batch['input_ids'],
                                         attention_mask=micro_batch['attention_mask'],
                                         position_ids=micro_batch['position_ids'])
-            rm_score = output.logits  # (batch_size,)
+            rm_score = output.logits
             rm_score = rm_score.squeeze(-1)
             return rm_score
 
     def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor):
+        # ... (此方法保持不变)
         batch_size = data.batch.batch_size[0]
-        # expand as token_level_reward
         attention_mask = data.batch['attention_mask']
         position_ids = data.batch['position_ids']
         response_length = data.batch['responses'].shape[-1]
-        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)  # (bsz, seqlen)
+        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
+        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
         token_level_scores[torch.arange(batch_size), eos_mask_idx] = scores
-
-        # select the response part
         token_level_scores = token_level_scores[:, -response_length:]
-
         return token_level_scores
-
+        
     def _switch_chat_template(self, data: DataProto):
+        # ... (此方法保持不变)
         src_max_length = data.batch['attention_mask'].shape[-1]
-
         src_tokenizer = self.input_tokenizer
         target_tokenizer = self.tokenizer
-
         rm_input_ids = []
         rm_attention_mask = []
-
         for i in range(data.batch.batch_size[0]):
-            # extract raw prompt
             chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
-
-            # extract response
             response_ids = data.batch['responses'][i]
             response_length = response_ids.shape[-1]
             valid_response_length = data.batch['attention_mask'][i][-response_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
             response = src_tokenizer.decode(valid_response_ids)
-            # remove bos and eos
             response = response.replace(src_tokenizer.eos_token, '')
-
             chat.append({'role': 'assistant', 'content': response})
-
-            prompt_with_chat_template = target_tokenizer.apply_chat_template(chat,
-                                                                             add_generation_prompt=False,
-                                                                             tokenize=False)
+            prompt_with_chat_template = target_tokenizer.apply_chat_template(chat, add_generation_prompt=False, tokenize=False)
             if self.rank == 0 and i == 0:
-                # for debugging purpose
                 print(f'Switch template. chat: {prompt_with_chat_template}')
-
-            # the maximum length is actually determined by the reward model itself
             max_length = self.config.get('max_length', src_max_length)
             if max_length is None:
                 max_length = src_max_length
@@ -786,37 +778,41 @@ class RewardModelWorker(Worker):
                 tokenizer=target_tokenizer,
                 max_length=max_length,
                 pad_token_id=target_tokenizer.pad_token_id,
-                left_pad=False,  # right padding
-                truncation=self.config.get('truncation', 'right'))  # truncate from the right
-
+                left_pad=False,
+                truncation=self.config.get('truncation', 'right'))
             rm_input_ids.append(input_ids)
             rm_attention_mask.append(attention_mask)
-
         rm_input_ids = torch.cat(rm_input_ids, dim=0)
         rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
-
         rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
-
         rm_inputs = {'input_ids': rm_input_ids, 'attention_mask': rm_attention_mask, 'position_ids': rm_position_ids}
-
         return DataProto.from_dict(rm_inputs)
 
+
+    # 核心修改点 2：修改 compute_rm_score 方法以支持逻辑分派
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
         data = data.to('cuda')
-        if self._do_switch_chat_template:
-            rm_data = self._switch_chat_template(data)
+        
+        # 如果是我们的序列熵奖励模式
+        if self.rm_calculator is not None:
+            output = self.rm_calculator.compute_reward(data)
+        # 否则，执行原来的标准奖励模型逻辑
+        else:
+            if self._do_switch_chat_template:
+                rm_data = self._switch_chat_template(data)
+            else:
+                rm_data = data
+            rm_data.batch = rm_data.batch.cuda()
+            micro_batches = rm_data.batch.split(self.config.micro_batch_size)
+            output_scores = []
+            for micro_batch in micro_batches:
+                rm_score = self._forward_micro_batch(micro_batch)
+                output_scores.append(rm_score)
+            scores = torch.cat(output_scores, dim=0)
+            token_level_scores = self._expand_to_token_level(data, scores)
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
 
-        rm_data.batch = rm_data.batch.cuda()
-        micro_batches = rm_data.batch.split(self.config.micro_batch_size)
-        output = []
-        for micro_batch in micro_batches:
-            rm_score = self._forward_micro_batch(micro_batch)
-            output.append(rm_score)
-        scores = torch.cat(output, dim=0)  # (batch_size)
-        token_level_scores = self._expand_to_token_level(data, scores)
-        # Note that this is only the scores, may not be the final rewards used to train RL
-        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
@@ -826,6 +822,7 @@ class PRIMERewardModelWorker(Worker):
     PRIME reward model.
     Can update itself whenever compute_rm_score is called.
     """
+    # ... (此类中的所有代码保持不变) ...
     def __init__(self, config):
         super().__init__()
         import torch.distributed
@@ -874,9 +871,9 @@ class PRIMERewardModelWorker(Worker):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             reward_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                               torch_dtype=torch.float32,
-                                                                               attn_implementation='flash_attention_2',
-                                                                               trust_remote_code=trust_remote_code)
+                                                                 torch_dtype=torch.float32,
+                                                                 attn_implementation='flash_attention_2',
+                                                                 trust_remote_code=trust_remote_code)
             reward_module.to(torch.float32)
             if enable_gradient_checkpointing:
                 reward_module.gradient_checkpointing_enable()
@@ -960,10 +957,10 @@ class PRIMERewardModelWorker(Worker):
         import_external_libs(self.config.prime_model.get('external_lib', None))
         self.reward_module, self.reference_module = self._build_model_optimizer(config=self.config, enable_gradient_checkpointing=self.config.prime_model.get('enable_gradient_checkpointing', False))
         self.prm = DataParallelPRIME(config=self.config,
-                                    reward_module=self.reward_module,
-                                    reference_module=self.reference_module,
-                                    reward_optimizer=self.reward_optimizer,
-                                    prime_loss_fn=self.config.prime_model.get('loss_type', 'ce'))
+                                     reward_module=self.reward_module,
+                                     reference_module=self.reference_module,
+                                     reward_optimizer=self.reward_optimizer,
+                                     prime_loss_fn=self.config.prime_model.get('loss_type', 'ce'))
         torch.cuda.empty_cache()
 
     def _switch_chat_template(self, data: DataProto):
@@ -1083,24 +1080,3 @@ class PRIMERewardModelWorker(Worker):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.reward_module, offload_grad=self._is_offload_grad)
-
-class FSDPSequenceEntropyRewardWorker(RewardModelWorker):
-    """
-    一个专门用于序列熵奖励的 Worker (FSDP后端版本)。
-    它会实例化 FSDPSequenceEntropyRewardModel。
-    """
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
-        # 重写 init_model 方法
-        # 因为我们的奖励模型是纯计算单元，所以这里非常简单。
-        # 我们只需要实例化 FSDPSequenceEntropyRewardModel 即可。
-        self.rm = FSDPSequenceEntropyRewardModel(config=self.config)
-        print("INFO: FSDPSequenceEntropyRewardWorker initialized its reward model.")
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_rm_score(self, data: DataProto):
-        # 重写核心的打分方法，直接调用我们模型的 compute_reward
-        data.batch = data.batch.cuda()
-        output = self.rm.compute_reward(data)
-        output = output.to('cpu')
-        return output
